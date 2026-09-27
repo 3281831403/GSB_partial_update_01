@@ -1,0 +1,365 @@
+package mql
+
+import (
+	"fmt"
+	"strings"
+	"text/scanner"
+)
+
+type Parser struct {
+	s     scanner.Scanner
+	tok   rune
+	text  string
+	input string
+	pos   scanner.Position
+}
+
+func NewParser(input string) *Parser {
+	var s scanner.Scanner
+	s.Init(strings.NewReader(input))
+	s.Mode = scanner.ScanIdents | scanner.ScanStrings | scanner.ScanInts
+	p := &Parser{s: s, input: input}
+	p.pos = s.Pos()
+	p.next()
+	return p
+}
+
+func (p *Parser) next() {
+	p.tok = p.s.Scan()
+	p.text = p.s.TokenText()
+	p.pos = p.s.Pos()
+}
+
+func (p *Parser) Parse() (Expr, error) {
+	return p.parseOr()
+}
+
+func (p *Parser) parseOr() (Expr, error) {
+	left, err := p.parseAnd()
+	if err != nil {
+		return nil, err
+	}
+	for p.text == "OR" {
+		p.next()
+		right, err := p.parseAnd()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Op: "OR", Left: left, Right: right}
+	}
+	return left, nil
+}
+
+func (p *Parser) parseAnd() (Expr, error) {
+	left, err := p.parseUnary()
+	if err != nil {
+		return nil, err
+	}
+	for p.text == "AND" {
+		p.next()
+		right, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Op: "AND", Left: left, Right: right}
+	}
+	return left, nil
+}
+
+func (p *Parser) parseUnary() (Expr, error) {
+	if p.text == "NOT" {
+		p.next()
+		expr, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		return &NotExpr{Expr: expr}, nil
+	}
+	return p.parsePrimary()
+}
+
+func (p *Parser) parsePrimary() (Expr, error) {
+	if p.text == "(" {
+		p.next()
+		expr, err := p.Parse()
+		if err != nil {
+			return nil, err
+		}
+		if p.text != ")" {
+			return nil, fmt.Errorf("expected ')'")
+		}
+		p.next()
+		return &GroupExpr{Inner: expr}, nil
+	}
+	return p.parseTerm()
+}
+
+func (p *Parser) parseTerm() (Expr, error) {
+	// Build the key by reading tokens. Keys can contain dots (e.g., "ci.repo")
+	// The loop continues while we see dots, building up the full key name.
+	// It stops when we hit the operator (":", "IN", or "NOT")
+	var key strings.Builder
+	key.WriteString(p.text)
+	p.next()
+
+	// Continue reading tokens for the key while we see dots
+	// This handles keys like "ci.repo" or "namespace.name"
+	for p.text == "." {
+		key.WriteString(p.text)
+		p.next()
+		if p.tok == scanner.Ident || p.tok == scanner.Int {
+			key.WriteString(p.text)
+			p.next()
+		}
+	}
+
+	switch p.text {
+	case ":":
+		// The colon token ends at p.pos.Offset (1-based), which means the next character (the value) starts at p.pos.Offset
+		// But we need to skip the colon itself. The colon is at p.pos.Offset - 1 (0-based), so value starts at p.pos.Offset (0-based = p.pos.Offset - 1 + 1)
+		// Actually, Offset is the position AFTER the token, so if colon is at index 7, Offset is 8, and value starts at index 8 (0-based)
+		colonEndPos := p.pos.Offset // 1-based position after colon
+		val := p.parseValueFromPos(colonEndPos)
+		return &TermExpr{Key: key.String(), Op: ":", Value: val}, nil
+	case "IN":
+		p.next()
+		return p.parseList(key.String(), "IN")
+	case "NOT":
+		p.next()
+		if p.text != "IN" {
+			return nil, fmt.Errorf("expected 'IN' after 'NOT'")
+		}
+		p.next()
+		return p.parseList(key.String(), "NOT IN")
+	}
+	return nil, fmt.Errorf("expected ':' or IN after key")
+}
+
+// isLogicalOperator checks if the remaining string starts with a logical operator
+func isLogicalOperator(remaining string) bool {
+	return strings.HasPrefix(remaining, "AND") ||
+		strings.HasPrefix(remaining, "OR") ||
+		strings.HasPrefix(remaining, "NOT")
+}
+
+// parseValueFromPos reads a value from the input string starting at the given position (1-based scanner position)
+// It continues reading until it hits whitespace or a logical operator (AND, OR, NOT)
+func (p *Parser) parseValueFromPos(startPos int) string {
+	// Convert 1-based scanner position to 0-based string index
+	// startPos is the position AFTER the colon token, so it's already pointing to the value start
+	startIdx := startPos - 1
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if startIdx >= len(p.input) {
+		return ""
+	}
+
+	// Skip the colon if we're still on it (shouldn't happen, but be safe)
+	if startIdx < len(p.input) && p.input[startIdx] == ':' {
+		startIdx++
+	}
+
+	// Skip whitespace at start
+	for startIdx < len(p.input) && (p.input[startIdx] == ' ' || p.input[startIdx] == '\t') {
+		startIdx++
+	}
+
+	// Check if it's a quoted string
+	if startIdx < len(p.input) && p.input[startIdx] == '"' {
+		// Find the closing quote
+		endIdx := startIdx + 1
+		for endIdx < len(p.input) && p.input[endIdx] != '"' {
+			if p.input[endIdx] == '\\' && endIdx+1 < len(p.input) {
+				endIdx += 2 // Skip escaped character
+			} else {
+				endIdx++
+			}
+		}
+		if endIdx < len(p.input) {
+			val := p.input[startIdx+1 : endIdx]
+			// Advance scanner past the quoted string. When the closing quote is
+			// the final character, the scanner is already at EOF and next() no
+			// longer advances its offset, so guard on forward progress to avoid
+			// looping forever (issue #221).
+			for p.s.Pos().Offset-1 < endIdx+1 {
+				prev := p.s.Pos().Offset
+				p.next()
+				if p.s.Pos().Offset == prev {
+					break // scanner reached EOF, no further progress possible
+				}
+			}
+			return val
+		}
+	}
+
+	// For unquoted values, read until whitespace or logical operator
+	var value strings.Builder
+	i := startIdx
+	for i < len(p.input) {
+		ch := p.input[i]
+
+		// Stop at whitespace
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			// Check if what follows is a logical operator - if so, stop here
+			// Otherwise, whitespace also ends the value
+			remaining := strings.TrimSpace(p.input[i:])
+			//nolint:staticcheck // SA4017: false positive - return value is used in condition
+			if isLogicalOperator(remaining) {
+				break
+			}
+			// For unquoted values, whitespace ends the value
+			break
+		}
+
+		// Stop at closing parenthesis
+		if ch == ')' {
+			break
+		}
+
+		value.WriteByte(ch)
+		i++
+	}
+
+	valStr := value.String()
+
+	// Advance the scanner to sync with our manual parsing
+	// We need to consume tokens until we're past the value we just read
+	for {
+		// Check if current token position is past our value
+		currPos := p.s.Pos().Offset - 1
+		if currPos >= i {
+			// We're past the value, we're synced
+			break
+		}
+		// Scan next token
+		p.next()
+		// If we hit EOF or a logical operator, stop
+		if p.tok == scanner.EOF || p.text == "AND" || p.text == "OR" || p.text == "NOT" {
+			break
+		}
+	}
+
+	return valStr
+}
+
+func (p *Parser) parseList(key, op string) (Expr, error) {
+	if p.text != "[" {
+		return nil, fmt.Errorf("expected '[' for %s clause", op)
+	}
+
+	// Read the list members straight from the input rather than from scanner
+	// tokens. The scanner mode does not treat "-", "@" or "." as part of an
+	// identifier, so token-per-member appended one member per token and shredded
+	// any unquoted UUID, date, email or semver string into its fragments
+	// (issue #233).
+	values, endIdx, err := p.parseListValues(p.pos.Offset)
+	if err != nil {
+		return nil, err
+	}
+
+	// Re-sync the scanner past the closing ']' so parsing can continue with the
+	// token that follows the list. Guard on forward progress: at EOF the scanner
+	// stops advancing its offset and the loop would never terminate.
+	for p.s.Pos().Offset <= endIdx {
+		prev := p.s.Pos().Offset
+		p.next()
+		if p.s.Pos().Offset == prev {
+			break
+		}
+	}
+	p.next()
+
+	return &TermExpr{Key: key, Op: op, Value: values}, nil
+}
+
+// parseListValues reads comma-separated list members from p.input starting at
+// startPos, the scanner position just after the opening '['. scanner.Position
+// Offset is a 0-based index of the character following the token, so startPos
+// indexes p.input directly and needs no adjustment (parseValueFromPos above
+// subtracts one and then skips the colon it lands on, which is the same thing
+// spelled differently). Members may be
+// quoted, in which case the quotes are stripped and commas, brackets and
+// whitespace inside them are literal. It returns the members and the index of
+// the closing ']'.
+func (p *Parser) parseListValues(startPos int) ([]string, int, error) {
+	values := []string{}
+	i := startPos
+
+	for {
+		for i < len(p.input) && isListSpace(p.input[i]) {
+			i++
+		}
+		if i >= len(p.input) {
+			return nil, 0, fmt.Errorf("expected ']' to close list")
+		}
+		if p.input[i] == ']' {
+			return values, i, nil
+		}
+
+		var value string
+		quoted := false
+		if p.input[i] == '"' {
+			quoted = true
+			end := i + 1
+			for end < len(p.input) && p.input[end] != '"' {
+				if p.input[end] == '\\' && end+1 < len(p.input) {
+					end += 2
+				} else {
+					end++
+				}
+			}
+			if end >= len(p.input) {
+				return nil, 0, fmt.Errorf("unterminated quoted value in list")
+			}
+			value = p.input[i+1 : end]
+			i = end + 1
+			for i < len(p.input) && isListSpace(p.input[i]) {
+				i++
+			}
+		} else {
+			end := i
+			for end < len(p.input) && p.input[end] != ',' && p.input[end] != ']' {
+				// The scanner treats '"' as opening a string no matter where it
+				// appears. If we accepted one mid-value the re-sync loop below
+				// would run the scanner into an unterminated string, swallow the
+				// rest of the input and silently drop any trailing clause.
+				if p.input[end] == '"' {
+					return nil, 0, fmt.Errorf(`unexpected '"' in unquoted list value: quote the whole value`)
+				}
+				end++
+			}
+			value = strings.TrimRight(p.input[i:end], listSpace)
+			i = end
+		}
+		// A member that is empty without having been written as "" is a missing
+		// one: a leading or doubled comma. Accepting it silently appends "" to
+		// the list, which then matches an empty field value — a member nobody
+		// wrote. An explicit "" is left alone, since that is a deliberate way to
+		// ask for the empty string.
+		if !quoted && value == "" {
+			return nil, 0, fmt.Errorf(`missing value in list: write "" if an empty member is intended`)
+		}
+		values = append(values, value)
+
+		if i >= len(p.input) {
+			return nil, 0, fmt.Errorf("expected ']' to close list")
+		}
+		switch p.input[i] {
+		case ',':
+			i++
+		case ']':
+			return values, i, nil
+		default:
+			return nil, 0, fmt.Errorf("expected ',' or ']' in list, got %q", p.input[i])
+		}
+	}
+}
+
+// listSpace is the whitespace a list may be padded with, in one place so the
+// skip loops and the trim below cannot drift apart.
+const listSpace = " \t\n\r"
+
+func isListSpace(ch byte) bool {
+	return strings.IndexByte(listSpace, ch) >= 0
+}

@@ -1,0 +1,535 @@
+package storage
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"reflect"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
+
+	serviceErrors "github.com/tink3rlabs/magic/errors"
+	slogger "github.com/tink3rlabs/magic/logger"
+	"github.com/tink3rlabs/magic/storage/search/lucene"
+)
+
+type queryBuilder func(*gorm.DB) *gorm.DB
+
+type SQLAdapter struct {
+	DB       *gorm.DB
+	config   map[string]string
+	provider StorageProviders
+}
+
+var sqlAdapterLock = &sync.Mutex{}
+var sqlAdapterInstance *SQLAdapter
+
+func GetSQLAdapterInstance(config map[string]string) *SQLAdapter {
+	if sqlAdapterInstance == nil {
+		sqlAdapterLock.Lock()
+		defer sqlAdapterLock.Unlock()
+		if sqlAdapterInstance == nil {
+			sqlAdapterInstance = &SQLAdapter{config: config}
+			sqlAdapterInstance.OpenConnection()
+		}
+	}
+	return sqlAdapterInstance
+}
+
+func (s *SQLAdapter) OpenConnection() {
+	var err error
+	s.provider = StorageProviders(s.config["provider"])
+	delete(s.config, "provider")
+
+	gormConf := gorm.Config{
+		NamingStrategy: schema.NamingStrategy{
+			TablePrefix:   fmt.Sprintf("%s.", s.config["schema"]),
+			SingularTable: false,
+		},
+		Logger: logger.Default.LogMode(logger.Silent),
+	}
+
+	switch s.provider {
+	case POSTGRESQL:
+		var dsn string
+		if dsn, err = postgresDSN(s.config); err == nil {
+			s.DB, err = gorm.Open(postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true}), &gormConf)
+		}
+	case MYSQL:
+		var dsn string
+		if dsn, err = mysqlDSN(s.config); err == nil {
+			s.DB, err = gorm.Open(mysql.New(mysql.Config{DSN: dsn}), &gormConf)
+		}
+	case SQLITE:
+		path := "file::memory:?cache=shared"
+		if s.config["path"] != "" {
+			path = s.config["path"]
+		}
+		s.DB, err = gorm.Open(sqlite.Open(path), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	default:
+		slogger.Fatal("this SQL provider is not supported, supported providers are: postgresql, mysql, and sqlite")
+
+	}
+
+	if err != nil {
+		slogger.Fatal("failed to open a database connection", slog.Any("error", err.Error()))
+	}
+}
+
+var (
+	// Dots allow Postgres custom settings such as pg_trgm.similarity_threshold.
+	validPostgresKey    = regexp.MustCompile(`^[A-Za-z0-9_.]+$`)
+	postgresValueQuoter = strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+)
+
+// postgresDSN quotes every value, so spaces, quotes or backslashes in a value
+// can't end it early or add settings.
+func postgresDSN(config map[string]string) (string, error) {
+	keys := make([]string, 0, len(config))
+	for key := range config {
+		if key == "schema" {
+			continue
+		}
+		if !validPostgresKey.MatchString(key) {
+			return "", fmt.Errorf("invalid postgres config key %q", key)
+		}
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	settings := make([]string, len(keys))
+	redacted := make([]string, len(keys))
+	for i, key := range keys {
+		settings[i] = fmt.Sprintf("%s='%s'", key, postgresValueQuoter.Replace(config[key]))
+		redacted[i] = settings[i]
+		if key == "password" {
+			redacted[i] = "password=xxxxx"
+		}
+	}
+	dsn := strings.Join(settings, " ")
+
+	// pgx masks the password in parse errors with a pattern that stops at an
+	// escaped quote, so report parse errors against a string without it.
+	if _, err := pgconn.ParseConfig(dsn); err != nil {
+		var parseErr *pgconn.ParseConfigError
+		if errors.As(err, &parseErr) {
+			parseErr.ConnString = strings.Join(redacted, " ")
+			return "", parseErr
+		}
+		return "", err
+	}
+	return dsn, nil
+}
+
+// mysqlDSN lets the driver escape the values. Options appended to dbname
+// after a "?" are still honored.
+func mysqlDSN(config map[string]string) (string, error) {
+	// The driver doesn't escape the user name, so a ':' would split it.
+	if strings.Contains(config["user"], ":") {
+		return "", errors.New("mysql user name must not contain ':'")
+	}
+	rawName, params, _ := strings.Cut(config["dbname"], "?")
+	dbname, err := url.PathUnescape(rawName)
+	if err != nil {
+		return "", fmt.Errorf("invalid mysql dbname: %w", err)
+	}
+	cfg, err := mysqldriver.ParseDSN("/?" + params)
+	if err != nil {
+		return "", fmt.Errorf("invalid mysql options in dbname: %w", err)
+	}
+	cfg.User = config["user"]
+	cfg.Passwd = config["password"]
+	cfg.Net = "tcp"
+	cfg.Addr = net.JoinHostPort(config["host"], config["port"])
+	cfg.DBName = dbname
+	return cfg.FormatDSN(), nil
+}
+
+// dbWithCtx returns s.DB bound to ctx when non-nil, letting gorm
+// propagate cancellation and deadlines into the underlying driver
+// as well as making the context available to gorm callbacks (used
+// by future DB-level tracing plugins). A nil context is treated as
+// context.Background.
+func (s *SQLAdapter) dbWithCtx(ctx context.Context) *gorm.DB {
+	if ctx == nil {
+		return s.DB.WithContext(context.Background())
+	}
+	return s.DB.WithContext(ctx)
+}
+
+func (s *SQLAdapter) Execute(statement string) error {
+	return s.ExecuteContext(context.Background(), statement)
+}
+
+func (s *SQLAdapter) ExecuteContext(ctx context.Context, statement string) error {
+	result := s.dbWithCtx(ctx).Exec(statement)
+	if result.Error != nil {
+		return fmt.Errorf("failed to execute statement %s: %v", statement, result.Error)
+	}
+	return nil
+}
+
+func (s *SQLAdapter) Ping() error {
+	return s.PingContext(context.Background())
+}
+
+func (s *SQLAdapter) PingContext(ctx context.Context) error {
+	db, err := s.DB.DB()
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %v", err)
+	}
+	return db.PingContext(ctx)
+}
+
+func (s *SQLAdapter) GetType() StorageAdapterType {
+	return SQL
+}
+
+func (s *SQLAdapter) GetProvider() StorageProviders {
+	return s.provider
+}
+
+func (s *SQLAdapter) GetSchemaName() string {
+	return s.config["schema"]
+}
+
+func (s *SQLAdapter) CreateSchema() error {
+	if s.GetProvider() != SQLITE {
+		statement := fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", s.GetSchemaName())
+		return s.Execute(statement)
+	}
+	return nil
+}
+
+func (s *SQLAdapter) CreateMigrationTable() error {
+	var statement string
+	switch s.GetProvider() {
+	case POSTGRESQL:
+		statement = fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s.migrations (id NUMERIC PRIMARY KEY, name TEXT, description TEXT, timestamp NUMERIC)",
+			s.GetSchemaName())
+	case MYSQL:
+		statement = "CREATE TABLE IF NOT EXISTS migrations (id INT PRIMARY KEY, name TEXT, description TEXT, timestamp BIGINT)"
+	case SQLITE:
+		statement = "CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, name TEXT, description TEXT, timestamp INTEGER)"
+	}
+	return s.Execute(statement)
+}
+
+func (s *SQLAdapter) UpdateMigrationTable(id int, name string, desc string) error {
+	var statement string
+	switch s.GetProvider() {
+	case SQLITE:
+		statement = fmt.Sprintf(`INSERT INTO migrations VALUES(%v, '%v', '%v', %v)`, id, name, desc, time.Now().UnixMilli())
+	default:
+		statement = fmt.Sprintf(`INSERT INTO %s.migrations VALUES(%v, '%v', '%v', %v)`, s.GetSchemaName(), id, name, desc, time.Now().UnixMilli())
+	}
+	return s.Execute(statement)
+}
+
+func (s *SQLAdapter) GetLatestMigration() (int, error) {
+	var statement string
+	var latestMigration int
+	var fromSource string
+	switch s.GetProvider() {
+	case SQLITE:
+		fromSource = "migrations"
+	default:
+		fromSource = fmt.Sprintf("%s.migrations", s.GetSchemaName())
+	}
+
+	statement = fmt.Sprintf("SELECT max(id) from %s", fromSource)
+	result := s.DB.Raw(statement).Scan(&latestMigration)
+	if result.Error != nil {
+		//either a real issue or there are no migrations yet check if we can query the migration table
+		var count int
+		statement = fmt.Sprintf("SELECT count(*) from %s", fromSource)
+		countResult := s.DB.Raw(statement).Scan(&count)
+		if countResult.Error != nil {
+			return latestMigration, result.Error
+		}
+	}
+	return latestMigration, nil
+}
+
+func (s *SQLAdapter) Create(item any, params ...map[string]any) error {
+	return s.CreateContext(context.Background(), item, params...)
+}
+
+func (s *SQLAdapter) CreateContext(ctx context.Context, item any, params ...map[string]any) error {
+	result := s.dbWithCtx(ctx).Create(reflect.ValueOf(item).Interface())
+	return result.Error
+}
+
+func (s *SQLAdapter) Get(dest any, filter map[string]any, params ...map[string]any) error {
+	return s.GetContext(context.Background(), dest, filter, params...)
+}
+
+func (s *SQLAdapter) GetContext(ctx context.Context, dest any, filter map[string]any, params ...map[string]any) error {
+	if len(filter) == 0 {
+		return errors.New("filtering is required when getting a resource")
+	}
+	query, bindings, err := s.buildQuery(filter)
+	if err != nil {
+		return err
+	}
+	result := s.dbWithCtx(ctx).Where(query, bindings).Find(dest)
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return result.Error
+}
+
+func (s *SQLAdapter) Update(item any, filter map[string]any, params ...map[string]any) error {
+	return s.UpdateContext(context.Background(), item, filter, params...)
+}
+
+func (s *SQLAdapter) UpdateContext(ctx context.Context, item any, filter map[string]any, params ...map[string]any) error {
+	if len(filter) == 0 {
+		return errors.New("filtering is required when updating a resource")
+	}
+	query, bindings, err := s.buildQuery(filter)
+	if err != nil {
+		return err
+	}
+	result := s.dbWithCtx(ctx).Where(query, bindings).Save(item)
+	return result.Error
+}
+
+func (s *SQLAdapter) Delete(item any, filter map[string]any, params ...map[string]any) error {
+	return s.DeleteContext(context.Background(), item, filter, params...)
+}
+
+func (s *SQLAdapter) DeleteContext(ctx context.Context, item any, filter map[string]any, params ...map[string]any) error {
+	if len(filter) == 0 {
+		return errors.New("filtering is required when deleting a resource")
+	}
+	query, bindings, err := s.buildQuery(filter)
+	if err != nil {
+		return err
+	}
+	result := s.dbWithCtx(ctx).Where(query, bindings).Delete(item)
+	return result.Error
+}
+
+// executePaginatedQuery runs a cursor-paginated SELECT using the provided query builder scope.
+// The cursor is base64-encoded from the sortKey field value of the last returned row.
+// ctx is propagated to gorm so cancellation reaches the driver.
+func (s *SQLAdapter) executePaginatedQuery(
+	ctx context.Context,
+	dest any,
+	sortKey string,
+	sortDirection SortingDirection,
+	limit int,
+	cursor string,
+	builder queryBuilder,
+) (string, error) {
+	if err := validateSortKey(sortKey); err != nil {
+		return "", err
+	}
+	var cursorValue string
+	if cursor != "" {
+		bytes, err := base64.StdEncoding.DecodeString(cursor)
+		if err != nil {
+			return "", fmt.Errorf("invalid cursor: %w", err)
+		}
+		cursorValue = string(bytes)
+	}
+	q := s.dbWithCtx(ctx).Model(dest).Scopes(builder)
+
+	q = q.Limit(limit + 1).Order(fmt.Sprintf("%s %s", sortKey, sortDirection))
+
+	if cursorValue != "" {
+		cursorOp := ">"
+		if sortDirection == Descending {
+			cursorOp = "<"
+		}
+		q = q.Where(fmt.Sprintf("%s %s ?", sortKey, cursorOp), cursorValue)
+	}
+
+	if result := q.Find(dest); result.Error != nil {
+		slog.Error("Query execution failed", "error", result.Error)
+		return "", result.Error
+	}
+
+	destSlice := reflect.ValueOf(dest).Elem()
+	if destSlice.Len() == 0 {
+		return "", nil
+	}
+
+	nextCursor := ""
+	if destSlice.Len() > limit {
+		lastItem := destSlice.Index(limit - 1)
+		field := findFieldByJSONTag(reflect.Indirect(lastItem), sortKey)
+		if !field.IsValid() {
+			slog.Warn("cursor extraction failed: sort_key does not match any json tag on the struct",
+				"sort_key", sortKey,
+				"hint", "sort_key must match a json tag (e.g. 'created_at'), not the Go field name (e.g. 'CreatedAt')")
+		} else if field.Kind() != reflect.String {
+			slog.Warn("cursor extraction failed: struct field is not a string",
+				"sort_key", sortKey,
+				"field_kind", field.Kind().String())
+		} else {
+			nextCursor = base64.StdEncoding.EncodeToString([]byte(field.String()))
+		}
+		destSlice.Set(destSlice.Slice(0, limit))
+	}
+
+	return nextCursor, nil
+}
+
+// findFieldByJSONTag looks up a struct field by its json tag name.
+// This is needed because sortKey uses the JSON/column name (e.g. "id")
+// while Go struct fields use PascalCase (e.g. "Id").
+func findFieldByJSONTag(v reflect.Value, tag string) reflect.Value {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		jsonTag := t.Field(i).Tag.Get("json")
+		if idx := strings.Index(jsonTag, ","); idx != -1 {
+			jsonTag = jsonTag[:idx]
+		}
+		if jsonTag == tag {
+			return v.Field(i)
+		}
+	}
+	return reflect.Value{}
+}
+
+func (s *SQLAdapter) List(dest any, sortKey string, filter map[string]any, limit int, cursor string, params ...map[string]any) (string, error) {
+	return s.ListContext(context.Background(), dest, sortKey, filter, limit, cursor, params...)
+}
+
+func (s *SQLAdapter) ListContext(ctx context.Context, dest any, sortKey string, filter map[string]any, limit int, cursor string, params ...map[string]any) (string, error) {
+	sortDirection, err := extractSortDirection(extractParams(params...))
+	if err != nil {
+		return "", fmt.Errorf("failed to list: %w", err)
+	}
+	var query string
+	var bindings map[string]any
+	if len(filter) > 0 {
+		if query, bindings, err = s.buildQuery(filter); err != nil {
+			return "", err
+		}
+	}
+	return s.executePaginatedQuery(ctx, dest, sortKey, sortDirection, limit, cursor, func(q *gorm.DB) *gorm.DB {
+		if query != "" {
+			return q.Where(query, bindings)
+		}
+		return q
+	})
+}
+
+func (s *SQLAdapter) Search(dest any, sortKey string, query string, limit int, cursor string, params ...map[string]any) (string, error) {
+	return s.SearchContext(context.Background(), dest, sortKey, query, limit, cursor, params...)
+}
+
+func (s *SQLAdapter) SearchContext(ctx context.Context, dest any, sortKey string, query string, limit int, cursor string, params ...map[string]any) (string, error) {
+	sortDirection, err := extractSortDirection(extractParams(params...))
+	if err != nil {
+		return "", fmt.Errorf("failed to search: %w", err)
+	}
+	if query == "" {
+		return s.executePaginatedQuery(ctx, dest, sortKey, sortDirection, limit, cursor, func(q *gorm.DB) *gorm.DB {
+			return q
+		})
+	}
+
+	destType := reflect.TypeOf(dest).Elem().Elem()
+	model := reflect.New(destType).Elem().Interface()
+
+	parser, err := lucene.NewParser(model)
+	if err != nil {
+		slog.Error("Parser creation failed", "error", err)
+		return "", err
+	}
+
+	// Pass the SQL provider to generate provider-specific SQL syntax
+	whereClause, queryParams, err := parser.ParseToSQL(query, string(s.provider))
+	if err != nil {
+		slog.Error("Filter parsing failed", "error", err)
+		// Wrap InvalidFieldError as BadRequest for proper HTTP 400 response
+		if _, ok := err.(*lucene.InvalidFieldError); ok {
+			return "", &serviceErrors.BadRequest{Message: err.Error()}
+		}
+		return "", err
+	}
+
+	slog.Debug(fmt.Sprintf(`Where clause: %s, with params %s`, whereClause, queryParams))
+
+	return s.executePaginatedQuery(ctx, dest, sortKey, sortDirection, limit, cursor, func(q *gorm.DB) *gorm.DB {
+		if whereClause != "" {
+			return q.Where(whereClause, queryParams...)
+		}
+		return q
+	})
+}
+
+func (s *SQLAdapter) Count(dest any, filter map[string]any, params ...map[string]any) (int64, error) {
+	return s.CountContext(context.Background(), dest, filter, params...)
+}
+
+func (s *SQLAdapter) CountContext(ctx context.Context, dest any, filter map[string]any, params ...map[string]any) (int64, error) {
+	q := s.dbWithCtx(ctx).Model(dest)
+
+	if len(filter) > 0 {
+		query, bindings, err := s.buildQuery(filter)
+		if err != nil {
+			return 0, err
+		}
+		q = q.Where(query, bindings)
+	}
+
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		slog.Error("Error finding count")
+		return 0, err
+	}
+	return total, nil
+}
+
+func (s *SQLAdapter) Query(dest any, statement string, limit int, cursor string, params ...map[string]any) (string, error) {
+	return s.QueryContext(context.Background(), dest, statement, limit, cursor, params...)
+}
+
+func (s *SQLAdapter) QueryContext(ctx context.Context, dest any, statement string, limit int, cursor string, params ...map[string]any) (string, error) {
+	return "", fmt.Errorf("not implemented yet")
+}
+
+
+// buildQuery rejects keys that aren't plain column names: keys are written
+// into the SQL as-is, only values are bound.
+func (s *SQLAdapter) buildQuery(filter map[string]any) (string, map[string]any, error) {
+	clauses := []string{}
+	bindings := make(map[string]any)
+
+	for key, value := range filter {
+		if !validColumnName.MatchString(key) {
+			return "", nil, fmt.Errorf("invalid filter key %q: must match [a-zA-Z_][a-zA-Z0-9_]*", key)
+		}
+		if value == nil {
+			// For nil values, use IS NULL instead of = @key
+			clauses = append(clauses, fmt.Sprintf("%s IS NULL", key))
+		} else {
+			// For non-nil values, use = @key and include in bindings
+			clauses = append(clauses, fmt.Sprintf("%s = @%s", key, key))
+			bindings[key] = value
+		}
+	}
+	return strings.Join(clauses, " AND "), bindings, nil
+}
